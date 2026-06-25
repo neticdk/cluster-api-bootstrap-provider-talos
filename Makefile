@@ -8,6 +8,7 @@ NAME := cluster-api-talos-controller
 
 ARTIFACTS := _out
 TEST_RUN ?= ./...
+TESTPKGS ?= ./api/... ./controllers/...
 
 TOOLS ?= ghcr.io/siderolabs/tools:v1.13.0
 PKGS ?= v1.13.0
@@ -19,12 +20,31 @@ KRES_IMAGE ?= ghcr.io/siderolabs/kres:latest
 CONTROLLER_GEN_VERSION ?= v0.19.0
 CONVERSION_GEN_VERSION ?= v0.34.0
 
-BUILD := docker buildx build
-PLATFORM ?= linux/amd64
+CONTAINER_ENGINE ?= docker
+
+ifeq ($(CONTAINER_ENGINE),podman)
+BUILD := $(CONTAINER_ENGINE) build
+LOAD_ARG :=
+PROGRESS ?=
+PUSH_ARG :=
+FORMAT_ARG := --format=docker
+else
+BUILD := $(CONTAINER_ENGINE) buildx build
+LOAD_ARG := --load
 PROGRESS ?= auto
+PUSH_ARG := --push=$(PUSH)
+FORMAT_ARG :=
+endif
+
+PLATFORM ?= linux/amd64
 PUSH ?= false
 COMMON_ARGS := --file=Dockerfile
+ifneq ($(PROGRESS),)
 COMMON_ARGS += --progress=$(PROGRESS)
+endif
+ifneq ($(FORMAT_ARG),)
+COMMON_ARGS += $(FORMAT_ARG)
+endif
 COMMON_ARGS += --platform=$(PLATFORM)
 COMMON_ARGS += --build-arg=REGISTRY_AND_USERNAME=$(REGISTRY_AND_USERNAME)
 COMMON_ARGS += --build-arg=NAME=$(NAME)
@@ -35,6 +55,7 @@ COMMON_ARGS += --build-arg=CONTROLLER_GEN_VERSION=$(CONTROLLER_GEN_VERSION)
 COMMON_ARGS += --build-arg=CONVERSION_GEN_VERSION=$(CONVERSION_GEN_VERSION)
 COMMON_ARGS += --build-arg=TALOS_VERSION=$(TALOS_VERSION)
 COMMON_ARGS += --build-arg=ARTIFACTS=$(ARTIFACTS)
+COMMON_ARGS += --build-arg=TESTPKGS="$(TESTPKGS)"
 
 all: manifests container
 
@@ -49,7 +70,17 @@ target-%: ## Builds the specified target defined in the Dockerfile. The build re
 		$(TARGET_ARGS) .
 
 local-%: ## Builds the specified target defined in the Dockerfile using the local output type. The build result will be output to the specified local destination.
+ifeq ($(CONTAINER_ENGINE),podman)
+	@$(MAKE) target-$* TARGET_ARGS="--tag $(NAME)-$*_tmp $(TARGET_ARGS)"
+	@$(CONTAINER_ENGINE) create --name $(NAME)-$*_tmp_container $(NAME)-$*_tmp
+	@mkdir -p $(DEST)
+	@$(CONTAINER_ENGINE) export $(NAME)-$*_tmp_container | tar -x -C $(DEST)
+	@-$(CONTAINER_ENGINE) rm -f $(NAME)-$*_tmp_container >/dev/null 2>&1
+	@-$(CONTAINER_ENGINE) rmi -f $(NAME)-$*_tmp >/dev/null 2>&1
+	@-rm -f $(DEST)/.dockerenv $(DEST)/.containerenv
+else
 	@$(MAKE) target-$* TARGET_ARGS="--output=type=local,dest=$(DEST) $(TARGET_ARGS)"
+endif
 
 docker-%: ## Builds the specified target defined in the Dockerfile using the docker output type. The build result will be loaded into docker.
 	@$(MAKE) target-$* TARGET_ARGS="--tag $(REGISTRY_AND_USERNAME)/$(NAME):$(TAG) $(TARGET_ARGS)"
@@ -84,7 +115,12 @@ generate: ## Generate source code.
 
 .PHONY: container
 container: generate ## Build the container image.
-	@$(MAKE) docker-$@ TARGET_ARGS="--push=$(PUSH)"
+	@$(MAKE) docker-$@ TARGET_ARGS="$(PUSH_ARG)"
+ifeq ($(CONTAINER_ENGINE),podman)
+ifeq ($(PUSH),true)
+	@$(CONTAINER_ENGINE) push $(REGISTRY_AND_USERNAME)/$(NAME):$(TAG)
+endif
+endif
 
 .PHONY: manifests
 manifests: ## Generate manifests (e.g. CRD, RBAC, etc.).
@@ -120,18 +156,22 @@ uninstall: manifests ## Uninstall CRDs from a cluster.
 
 .PHONY: run
 run: install ## Run the controller locally. This is for testing purposes only.
-	@$(MAKE) docker-container TARGET_ARGS="--load"
-	@docker run --rm -it --net host -v $(PWD):/src -v $(KUBECONFIG):/root/.kube/config -e KUBECONFIG=/root/.kube/config $(REGISTRY_AND_USERNAME)/$(NAME):$(TAG)
+	@$(MAKE) docker-container TARGET_ARGS="$(LOAD_ARG)"
+	@$(CONTAINER_ENGINE) run --rm -it --net host -v $(PWD):/src -v $(KUBECONFIG):/root/.kube/config -e KUBECONFIG=/root/.kube/config $(REGISTRY_AND_USERNAME)/$(NAME):$(TAG)
 
 .PHONY: clean
 clean:
 	@rm -rf $(ARTIFACTS)
 
+.PHONY: unit-tests
+unit-tests:  ## Performs unit tests inside container
+	@$(MAKE) local-$@ DEST=$(ARTIFACTS)
+
 check-dirty: ## Verifies that source tree is not dirty
 	@if test -n "`git status --porcelain`"; then echo "Source tree is dirty"; git status; exit 1 ; fi
 
 conformance:  ## Performs policy checks against the commit and source code.
-	docker run --rm -it -v $(PWD):/src -w /src ghcr.io/siderolabs/conform:latest enforce
+	$(CONTAINER_ENGINE) run --rm -it -v $(PWD):/src -w /src ghcr.io/siderolabs/conform:latest enforce
 
 # Make `make test` behave just like `go test` regarding relative paths.
 test:  ## Run tests.
@@ -160,5 +200,5 @@ env-down: talosctl ## Stop development environment.
 
 .PHONY: rekres
 rekres:
-	@docker pull $(KRES_IMAGE)
-	@docker run --rm --net=host --user $(shell id -u):$(shell id -g) -v $(PWD):/src -w /src -e GITHUB_TOKEN $(KRES_IMAGE)
+	@$(CONTAINER_ENGINE) pull $(KRES_IMAGE)
+	@$(CONTAINER_ENGINE) run --rm --net=host --user $(shell id -u):$(shell id -g) -v $(PWD):/src -w /src -e GITHUB_TOKEN $(KRES_IMAGE)

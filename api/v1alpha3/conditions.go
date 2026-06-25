@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+//nolint:staticcheck
 package v1alpha3
 
 import capiv1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
@@ -13,33 +14,31 @@ const (
 	//
 	// NOTE: When the DataSecret generation starts the process completes immediately and within the
 	// same reconciliation, so the user will always see a transition from Wait to Generated without having
-	// evidence that BootstrapSecret generation is started/in progress.
+	// the chance to observe "Waiting" (with the exception of errors or temporary blocks).
+	//
+	// Deprecated: this condition will be removed when support for CAPI v1beta1 contract will be dropped.
+	//
+	// +optional
 	DataSecretAvailableCondition capiv1.ConditionType = "DataSecretAvailable"
 
-	// DataSecretAvailableReason documents a succeeded bootstrap secret generation process.
+	// DataSecretNotAvailableReason is set when the bootstrap secret was not yet generated.
 	//
-	// NOTE: This is the only reason for DataSecretAvailableCondition becoming true.
+	// Deprecated: this reason will be removed when support for CAPI v1beta1 contract will be dropped.
+	//
+	// +optional
+	DataSecretNotAvailableReason = "DataSecretNotAvailable"
+
+	// DataSecretNotAvailableInternalErrorReason is set when the bootstrap secret generation failed.
+	//
+	// Deprecated: this reason will be removed when support for CAPI v1beta1 contract will be dropped.
+	//
+	// +optional
+	DataSecretNotAvailableInternalErrorReason = "DataSecretNotAvailableInternalError"
+
+	// DataSecretAvailableReason is set when the bootstrap secret is successfully generated and ready.
+	//
+	// Deprecated: this reason will be removed when support for CAPI v1beta1 contract will be dropped.
+	//
+	// +optional
 	DataSecretAvailableReason = "DataSecretAvailable"
-
-	// WaitingForClusterInfrastructureReason (Severity=Info) document a bootstrap secret generation process
-	// waiting for the cluster infrastructure to be ready.
-	//
-	// NOTE: Having the cluster infrastructure ready is a pre-condition for starting to create machines;
-	// the TalosConfig controller ensure this pre-condition is satisfied.
-	WaitingForClusterInfrastructureReason = "WaitingForClusterInfrastructure"
-
-	// DataSecretGenerationFailedReason (Severity=Warning) documents a TalosConfig controller detecting
-	// an error while generating a data secret; those kind of errors are usually due to misconfigurations
-	// and user intervention is required to get them fixed.
-	DataSecretGenerationFailedReason = "DataSecretGenerationFailed"
-)
-
-const (
-	// ClientConfigAvailableCondition documents the status of the client config generation process.
-	ClientConfigAvailableCondition capiv1.ConditionType = "ClientConfigAvailable"
-
-	// ClientConfigGenerationFailedReason (Severity=Warning) documents a TalosConfig controller detecting
-	// an error while generating a client config; those kind of errors are usually due to misconfigurations
-	// and user intervention is required to get them fixed.
-	ClientConfigGenerationFailedReason = "ClientConfigGenerationFailed"
 )

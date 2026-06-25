@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
@@ -32,6 +33,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -134,7 +136,7 @@ func (r *TalosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Lookup the talosconfig config
 	config := &bootstrapv1beta1.TalosConfig{}
-	if err := r.Client.Get(ctx, req.NamespacedName, config); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, config); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -151,7 +153,7 @@ func (r *TalosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Always attempt to Patch the TalosConfig object and status after each reconciliation.
 	defer func() {
 		// always update the readyCondition; the summary is represented using the "1 of x completed" notation.
-		conditions.SetSummaryCondition(config, config, bootstrapv1beta1.DataSecretAvailableCondition)
+		_ = conditions.SetSummaryCondition(config, config, bootstrapv1beta1.DataSecretAvailableCondition)
 		v1beta1conditions.SetSummary(config,
 			v1beta1conditions.WithConditions(
 				bootstrapv1beta1.DataSecretAvailableV1Beta1Condition,
@@ -186,7 +188,7 @@ func (r *TalosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Handle deleted talosconfigs
 	// We no longer set finalizers on talosconfigs, but we have to remove previously set finalizers
-	if !config.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !config.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(config)
 	}
 
@@ -311,6 +313,26 @@ func (r *TalosConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err = r.reconcileGenerate(ctx, tcScope); err != nil {
+		var reqErr *requeueError
+		if errors.As(err, &reqErr) {
+			log.Info("reconcileGenerate requested requeue: " + err.Error())
+			v1beta1conditions.MarkFalse(
+				config,
+				bootstrapv1beta1.DataSecretAvailableV1Beta1Condition,
+				bootstrapv1beta1.WaitingForClusterInfrastructureV1Beta1Reason,
+				capiv1.ConditionSeverityInfo,
+				"%s",
+				err.Error(),
+			)
+			conditions.Set(config, metav1.Condition{
+				Type:    bootstrapv1beta1.DataSecretAvailableCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  "WaitingForVariables",
+				Message: err.Error(),
+			})
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
 		v1beta1conditions.MarkFalse(
 			config,
 			bootstrapv1beta1.DataSecretAvailableV1Beta1Condition,
@@ -349,6 +371,57 @@ func (r *TalosConfigReconciler) reconcileGenerate(ctx context.Context, tcScope *
 
 	config := tcScope.Config
 
+	// 1. Resolve Variables
+	variables, err := r.resolveVariables(ctx, tcScope)
+	if err != nil {
+		return err
+	}
+
+	// 2. Prepare templates context
+
+	tmplCtx := TemplateContext{
+		Vars: variables,
+	}
+	tmplCtx.Machine.Name = tcScope.ConfigOwner.GetName()
+
+	// 3. Render templates of data, strategic merge patches, and JSON patches locally (without mutating the Spec object itself)
+	dataStr := config.Spec.Data
+	if dataStr != "" {
+		dataStr, err = renderTemplate("data", dataStr, tmplCtx)
+		if err != nil {
+			return fmt.Errorf("failed to render Spec.Data template: %w", err)
+		}
+	}
+
+	strategicPatches := config.Spec.StrategicPatches
+	if len(strategicPatches) > 0 {
+		renderedPatches := make([]string, len(strategicPatches))
+		for i, sp := range strategicPatches {
+			renderedPatches[i], err = renderTemplate(fmt.Sprintf("strategicPatch[%d]", i), sp, tmplCtx)
+			if err != nil {
+				return fmt.Errorf("failed to render StrategicPatch[%d] template: %w", i, err)
+			}
+		}
+		strategicPatches = renderedPatches
+	}
+
+	jsonPatches := config.Spec.ConfigPatches
+	if len(jsonPatches) > 0 {
+		marshalled, err := json.Marshal(jsonPatches)
+		if err != nil {
+			return fmt.Errorf("failed to marshal ConfigPatches: %w", err)
+		}
+		renderedJSON, err := renderTemplate("configPatches", string(marshalled), tmplCtx)
+		if err != nil {
+			return fmt.Errorf("failed to render ConfigPatches template: %w", err)
+		}
+		var unmarshalled []bootstrapv1beta1.ConfigPatches
+		if err := json.Unmarshal([]byte(renderedJSON), &unmarshalled); err != nil {
+			return fmt.Errorf("failed to unmarshal rendered ConfigPatches: %w", err)
+		}
+		jsonPatches = unmarshalled
+	}
+
 	machineType, _ := machine.ParseType(config.Spec.GenerateType) //nolint:errcheck // handle errors later
 
 	multiConfigPatches := []string{}
@@ -356,11 +429,11 @@ func (r *TalosConfigReconciler) reconcileGenerate(ctx context.Context, tcScope *
 	switch {
 	// Slurp and use user-supplied configs
 	case config.Spec.GenerateType == "none":
-		if config.Spec.Data == "" {
+		if dataStr == "" {
 			return errors.New("failed to specify config data with none generate type")
 		}
 
-		retData, err = r.userConfigs(ctx, tcScope)
+		retData, err = r.userConfigs(ctx, tcScope, dataStr)
 		if err != nil {
 			return err
 		}
@@ -378,8 +451,8 @@ func (r *TalosConfigReconciler) reconcileGenerate(ctx context.Context, tcScope *
 
 	// Handle JSON6902 patches to the machine config if they were specified
 	// Note this will patch both pre-generated and user-provided configs.
-	if len(config.Spec.ConfigPatches) > 0 {
-		marshalledPatches, err := json.Marshal(config.Spec.ConfigPatches)
+	if len(jsonPatches) > 0 {
+		marshalledPatches, err := json.Marshal(jsonPatches)
 		if err != nil {
 			return fmt.Errorf("failure marshalling config patches: %s", err)
 		}
@@ -398,7 +471,7 @@ func (r *TalosConfigReconciler) reconcileGenerate(ctx context.Context, tcScope *
 	}
 
 	// Handle strategic merge patches.
-	if strategicPatches := slices.AppendSeq(config.Spec.StrategicPatches, slices.Values(multiConfigPatches)); len(strategicPatches) > 0 {
+	if strategicPatches := slices.AppendSeq(strategicPatches, slices.Values(multiConfigPatches)); len(strategicPatches) > 0 {
 		patches := make([]configpatcher.Patch, 0, len(strategicPatches))
 
 		for _, strategicPatch := range strategicPatches {
@@ -486,10 +559,10 @@ func genTalosConfigFile(clusterName string, bundle *secrets.Bundle, endpoints []
 }
 
 // userConfigs will fetch and make use of user-supplied bootstrap configs to return
-func (r *TalosConfigReconciler) userConfigs(ctx context.Context, scope *TalosConfigScope) (*TalosConfigBundle, error) {
+func (r *TalosConfigReconciler) userConfigs(ctx context.Context, scope *TalosConfigScope, dataStr string) (*TalosConfigBundle, error) {
 	retBundle := &TalosConfigBundle{}
 
-	userConfig, err := configloader.NewFromBytes([]byte(scope.Config.Spec.Data))
+	userConfig, err := configloader.NewFromBytes([]byte(dataStr))
 	if err != nil {
 		return retBundle, err
 	}
@@ -623,7 +696,9 @@ func (r *TalosConfigReconciler) genConfigs(ctx context.Context, scope *TalosConf
 	}
 
 	if !scope.ConfigOwner.IsMachinePool() && scope.Config.Spec.Hostname.Source != "" {
+		//nolint:staticcheck // legacy Talos API compatibility
 		if data.RawV1Alpha1().MachineConfig.MachineNetwork == nil {
+			//nolint:staticcheck // legacy Talos API compatibility
 			data.RawV1Alpha1().MachineConfig.MachineNetwork = &v1alpha1.NetworkConfig{}
 		}
 
@@ -638,6 +713,7 @@ func (r *TalosConfigReconciler) genConfigs(ctx context.Context, scope *TalosConf
 
 				patches = append(patches, hostnameCfg)
 			} else {
+				//nolint:staticcheck // legacy Talos API compatibility
 				data.RawV1Alpha1().MachineConfig.MachineNetwork.NetworkHostname = scope.ConfigOwner.GetName()
 			}
 		}
@@ -656,6 +732,7 @@ func (r *TalosConfigReconciler) genConfigs(ctx context.Context, scope *TalosConf
 
 				patches = append(patches, hostnameCfg)
 			} else {
+				//nolint:staticcheck // legacy Talos API compatibility
 				data.RawV1Alpha1().MachineConfig.MachineNetwork.NetworkHostname = machine.Spec.InfrastructureRef.Name
 			}
 		}
@@ -722,7 +799,7 @@ func (r *TalosConfigReconciler) ClusterToTalosConfigs(ctx context.Context, o cli
 	}
 
 	machineList := &capiv1.MachineList{}
-	if err := r.Client.List(ctx, machineList, selectors...); err != nil {
+	if err := r.List(ctx, machineList, selectors...); err != nil {
 		return nil
 	}
 
@@ -736,7 +813,7 @@ func (r *TalosConfigReconciler) ClusterToTalosConfigs(ctx context.Context, o cli
 
 	if feature.Gates.Enabled(feature.MachinePool) {
 		machinePoolList := &capiv1.MachinePoolList{}
-		if err := r.Client.List(ctx, machinePoolList, selectors...); err != nil {
+		if err := r.List(ctx, machinePoolList, selectors...); err != nil {
 			return nil
 		}
 
@@ -762,4 +839,81 @@ func newHostnameConfig(hostname string) (string, error) {
 	err := yaml.NewEncoder(buf).Encode(hostnameConfig)
 
 	return buf.String(), err
+}
+
+type requeueError struct {
+	err error
+}
+
+func (e *requeueError) Error() string {
+	return e.err.Error()
+}
+
+func (e *requeueError) Unwrap() error {
+	return e.err
+}
+
+type TemplateContext struct {
+	Machine struct {
+		Name string
+	}
+	Vars map[string]string
+}
+
+func renderTemplate(name, text string, data TemplateContext) (string, error) {
+	if !strings.Contains(text, "{{") {
+		return text, nil
+	}
+	tmpl, err := template.New(name).Option("missingkey=error").Parse(text)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func (r *TalosConfigReconciler) resolveVariables(ctx context.Context, tcScope *TalosConfigScope) (map[string]string, error) {
+	resolvedVars := make(map[string]string)
+	config := tcScope.Config
+	machineName := tcScope.ConfigOwner.GetName()
+
+	tmplCtx := TemplateContext{}
+	tmplCtx.Machine.Name = machineName
+
+	for _, v := range config.Spec.Variables {
+		if v.ValueFrom.SecretKeyRef == nil {
+			return nil, fmt.Errorf("no variable source specified for variable %s", v.Name)
+		}
+
+		// 1. Evaluate template in secret name
+		secretName, err := renderTemplate("secretName", v.ValueFrom.SecretKeyRef.Name, tmplCtx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to render secret name template: %w", err)
+		}
+
+		// 2. Fetch the Secret from the cluster
+		secret := &corev1.Secret{}
+		secretKey := client.ObjectKey{Namespace: config.Namespace, Name: secretName}
+
+		if err := r.Get(ctx, secretKey, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Return a transient error so Reconcile knows to requeue
+				return nil, &requeueError{err: fmt.Errorf("waiting for metadata secret %s", secretName)}
+			}
+			return nil, err
+		}
+
+		// 3. Extract the value
+		val, exists := secret.Data[v.ValueFrom.SecretKeyRef.Key]
+		if !exists {
+			return nil, fmt.Errorf("key %s not found in secret %s", v.ValueFrom.SecretKeyRef.Key, secretName)
+		}
+
+		resolvedVars[v.Name] = string(val)
+	}
+
+	return resolvedVars, nil
 }
