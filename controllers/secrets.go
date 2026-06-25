@@ -28,7 +28,7 @@ import (
 
 func (r *TalosConfigReconciler) fetchSecret(ctx context.Context, config *bootstrapv1beta1.TalosConfig, secretName string) (*corev1.Secret, error) {
 	retSecret := &corev1.Secret{}
-	err := r.Client.Get(ctx, client.ObjectKey{
+	err := r.Get(ctx, client.ObjectKey{
 		Namespace: config.GetNamespace(),
 		Name:      secretName,
 	}, retSecret)
@@ -126,7 +126,7 @@ func (r *TalosConfigReconciler) writeSecretsBundleSecret(ctx context.Context, sc
 		},
 	}
 
-	return r.Client.Create(ctx, secret)
+	return r.Create(ctx, secret)
 }
 
 func (r *TalosConfigReconciler) writeK8sCASecret(ctx context.Context, scope *TalosConfigScope, certs *x509.PEMEncodedCertificateAndKey) error {
@@ -157,7 +157,7 @@ func (r *TalosConfigReconciler) writeK8sCASecret(ctx context.Context, scope *Tal
 		},
 	}
 
-	err = r.Client.Create(ctx, certSecret)
+	err = r.Create(ctx, certSecret)
 	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return err
 	}
@@ -198,19 +198,19 @@ func (r *TalosConfigReconciler) writeBootstrapData(ctx context.Context, scope *T
 		},
 	}
 
-	err = r.Client.Create(ctx, certSecret)
+	err = r.Create(ctx, certSecret)
 
 	return dataSecretName, err
 }
 
 // reconcileClientConfig creates/updates a TalosConfig for the cluster.
 func (r *TalosConfigReconciler) reconcileClientConfig(ctx context.Context, log logr.Logger, scope *TalosConfigScope) error {
-	if !(scope.Config.Spec.GenerateType == talosmachine.TypeControlPlane.String() || scope.Config.Spec.GenerateType == talosmachine.TypeInit.String()) {
+	if scope.Config.Spec.GenerateType != talosmachine.TypeControlPlane.String() && scope.Config.Spec.GenerateType != talosmachine.TypeInit.String() {
 		// can only reconcile for control plane machines
 		return nil
 	}
 
-	machines, err := collections.GetFilteredMachinesForCluster(ctx, r.Client, scope.Cluster, collections.ControlPlaneMachines(scope.Cluster.Name))
+	machines, err := collections.GetFilteredMachinesForCluster(ctx, r, scope.Cluster, collections.ControlPlaneMachines(scope.Cluster.Name))
 	if err != nil {
 		return fmt.Errorf("failed getting control plane machines: %w", err)
 	}
@@ -244,7 +244,7 @@ func (r *TalosConfigReconciler) reconcileClientConfig(ctx context.Context, log l
 
 	configSecret := &corev1.Secret{}
 
-	err = r.Client.Get(ctx, client.ObjectKey{Namespace: scope.Cluster.Namespace, Name: dataSecretName}, configSecret)
+	err = r.Get(ctx, client.ObjectKey{Namespace: scope.Cluster.Namespace, Name: dataSecretName}, configSecret)
 	if err != nil {
 		if !k8serrors.IsNotFound(err) {
 			return fmt.Errorf("error fetching secret: %w", err)
@@ -266,12 +266,12 @@ func (r *TalosConfigReconciler) reconcileClientConfig(ctx context.Context, log l
 			},
 		}
 
-		return r.Client.Create(ctx, configSecret)
+		return r.Create(ctx, configSecret)
 	}
 
 	configSecret.Data["talosconfig"] = []byte(talosConfig)
 
-	err = r.Client.Update(ctx, configSecret)
+	err = r.Update(ctx, configSecret)
 	if k8serrors.IsConflict(err) {
 		// ignore conflict errors, probably another reconcile fixed up the endpoints
 		err = nil

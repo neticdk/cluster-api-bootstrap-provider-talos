@@ -50,6 +50,14 @@ RUN --mount=type=cache,target=/.cache conversion-gen --output-file=zz_generated.
 FROM scratch AS generate
 COPY --from=generate-build /src/api /api
 
+# runs unit-tests inside container
+FROM build AS unit-tests-run
+ARG TESTPKGS
+RUN --mount=type=cache,target=/.cache --mount=type=cache,target=/tmp go test -v -covermode=atomic -coverprofile=coverage.txt -coverpkg=$(echo ${TESTPKGS} | tr ' ' ',') -count 1 ${TESTPKGS}
+
+FROM scratch AS unit-tests
+COPY --from=unit-tests-run /src/coverage.txt /coverage.txt
+
 FROM build AS integration-test-build
 ENV CGO_ENABLED 1
 ARG TALOS_VERSION

@@ -37,7 +37,34 @@ type TalosConfigSpec struct {
 
 	// Set hostname in the machine configuration to some value.
 	Hostname HostnameSpec `json:"hostname,omitempty"`
+
+	// Variables is a list of variables to resolve from Secrets.
+	Variables []Variable `json:"variables,omitempty"`
 	// Important: Run "make" to regenerate code after modifying this file
+}
+
+// Variable defines a variable name and where to resolve its value from.
+type Variable struct {
+	// Name of the variable to be used in templates. Must be a valid Go template identifier (alphanumeric and underscores, starting with a letter or underscore).
+	// +kubebuilder:validation:Pattern="^[a-zA-Z_][a-zA-Z0-9_]*$"
+	Name string `json:"name"`
+	// ValueFrom defines the source of the variable's value.
+	ValueFrom VariableSource `json:"valueFrom"`
+}
+
+// VariableSource defines the source of a variable's value.
+type VariableSource struct {
+	// SecretKeyRef selects a key of a Secret in the TalosConfig's namespace.
+	// +optional
+	SecretKeyRef *SecretKeySelector `json:"secretKeyRef,omitempty"`
+}
+
+// SecretKeySelector selects a key of a Secret.
+type SecretKeySelector struct {
+	// Name of the Secret. Go template syntax like {{ .Machine.Name }} is supported.
+	Name string `json:"name"`
+	// Key of the Secret to select.
+	Key string `json:"key"`
 }
 
 // HostnameSource is the definition of hostname source.
